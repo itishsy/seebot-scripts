@@ -1,0 +1,27 @@
+# RPA statistics script configuration example.
+# Copy this file to db.conf and fill real values locally.
+# Do not commit db.conf because it contains credentials.
+
+[mysql]
+host     = 127.0.0.1
+port     = 3306
+user     = rpa
+password = CHANGE_ME
+database = rpa_robot
+charset  = utf8mb4
+
+[mongodb]
+uri        = mongodb://127.0.0.1:27017
+database   = rpa
+collection = robot_execution_detail
+username   =
+password   =
+
+[standalone]
+base_url      = http://127.0.0.1:8080/api
+token_url     = http://127.0.0.1:8080/api/oauth/token
+client_id     = rpa
+client_secret = CHANGE_ME
+username      = seebot
+password      = CHANGE_ME
+

@@ -1,0 +1,8 @@
+db.conf
+reports/
+standalone-reports/
+*.xlsx
+~$*.xlsx
+__pycache__/
+*.py[cod]
+

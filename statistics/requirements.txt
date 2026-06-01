@@ -1,0 +1,6 @@
+pymysql
+pandas
+pymongo
+openpyxl
+requests
+urllib3
