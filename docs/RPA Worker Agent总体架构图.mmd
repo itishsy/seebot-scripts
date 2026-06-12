@@ -1,0 +1,46 @@
+flowchart TB
+    subgraph Cloud["云端 seebot 平台"]
+        Biz["seebot 业务系统<br/>企业缴费 / 在册 / 增减员 / 凭证"]
+        Scheduler["任务调度中心<br/>任务队列 / 业务状态流转"]
+        PollAPI["runner 拉任务接口<br/>/robot/task/poll?machineCode=xxx"]
+        RM["Windows VM Resource Manager<br/>Worker注册 / 状态 / lease / 画像 / 隔离"]
+        Lock["账号锁 / UKey锁 / Worker锁"]
+        FileLog["文件 / 日志 / 截图服务"]
+        DB[(核心数据表<br/>robot_task_queue<br/>rpa_env_profile<br/>rpa_worker_instance<br/>rpa_worker_lease)]
+        UKey["现有 UKey / CA 挂载中心"]
+    end
+
+    subgraph VMInfra["虚拟化资源池"]
+        VSphere["vSphere / Horizon"]
+        Image["城市级黄金镜像<br/>image-manifest.json<br/>rpa-env-{city}-{business}-{system}-{version}"]
+        HotCold["热池 / 冷池 VM"]
+    end
+
+    subgraph Worker["Windows VM / Windows 执行器"]
+        Agent["RPA Worker Agent<br/>rpa-client.exe 改造<br/>注册 / 心跳 / 画像上报<br/>runner启停 / 进程监管<br/>超时熔断 / 环境清理 / 隔离"]
+        Runner["rpa-runner.jar<br/>保留主动拉任务<br/>Selenium 操作浏览器<br/>调用 Python 操作桌面应用<br/>业务自检 / 结果回传"]
+        Runtime["本机运行环境<br/>Java / Python venv<br/>Chrome/Edge + WebDriver<br/>社保客户端 / 公积金客户端<br/>UKey/CA 驱动"]
+        LocalManifest["C:\\seebot-agent\\config\\image-manifest.json<br/>声明镜像画像"]
+    end
+
+    Biz --> Scheduler
+    Scheduler --> DB
+    Runner -->|"携带 machineCode 主动拉任务"| PollAPI
+    PollAPI -->|"返回任务前资源准入"| RM
+    RM --> DB
+    RM --> Lock
+    RM -->|"校验 required_env_profile_code == actual_env_profile_code"| PollAPI
+    PollAPI -->|"返回 task + leaseId"| Runner
+
+    Agent -->|"注册 / 心跳 / actual_env_profile_code"| RM
+    Agent -->|"读取并校验"| LocalManifest
+    Agent -->|"基础环境自检"| Runtime
+    Agent -->|"启动 / 停止 / 监管"| Runner
+    Runner -->|"日志 / 截图 / 附件"| FileLog
+    Runner -->|"业务结果 + leaseId"| Scheduler
+    Agent -->|"任务结束 / 清理完成 / release lease"| RM
+    Runner -->|"UKey/证书使用"| UKey
+    RM -->|"启动/回滚/销毁 VM"| VSphere
+    VSphere --> Image
+    Image --> HotCold
+    HotCold --> Worker

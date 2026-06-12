@@ -1,0 +1,43 @@
+sequenceDiagram
+    autonumber
+    participant Biz as seebot业务系统
+    participant Scheduler as 任务调度中心
+    participant RM as Windows VM Resource Manager
+    participant Agent as RPA Worker Agent<br/>rpa-client.exe
+    participant Runner as rpa-runner.jar
+    participant Poll as 云端拉任务接口
+    participant Lock as 账号锁/UKey锁
+    participant File as 文件日志截图服务
+
+    Biz->>Scheduler: 创建RPA任务<br/>写入 required_env_profile_code
+    Scheduler->>RM: 如无匹配Worker，可请求启动对应VM镜像
+    RM-->>Agent: VM启动后 Agent 开机运行
+    Agent->>Agent: 读取 image-manifest.json<br/>执行基础环境自检
+    Agent->>RM: 注册Worker<br/>上报 machineCode + actual_env_profile_code + healthStatus
+    Agent->>RM: 周期心跳<br/>IDLE / runnerStatus / actual_env_profile_code
+
+    Agent->>Runner: 启动或保持 runner 运行
+    Runner->>Poll: 携带 machineCode 主动拉任务
+
+    Poll->>RM: 查询Worker状态与实际画像
+    RM->>RM: 校验Worker已注册、在线、空闲、自检通过、未隔离
+    RM->>RM: 校验 task.required_env_profile_code == worker.actual_env_profile_code
+    RM->>Lock: 尝试锁定账号 / UKey / Worker
+    Lock-->>RM: 锁定成功
+    RM->>RM: 创建 lease
+    RM-->>Poll: 准入通过，返回 leaseId
+
+    Poll-->>Runner: 返回任务<br/>taskId + executionCode + leaseId + required/actual profile
+    Runner->>Agent: 本机通知 task-start<br/>taskId + leaseId
+    Agent->>RM: 心跳更新 RUNNING<br/>currentTaskId + currentLeaseId
+
+    Runner->>Runner: 业务环境自检<br/>UKey/证书/浏览器/客户端
+    Runner->>Runner: Selenium操作浏览器<br/>Python操作桌面应用
+    Runner->>File: 上传日志/截图/附件
+    Runner->>Scheduler: 回传业务结果<br/>携带 leaseId
+    Runner->>Agent: 本机通知 task-finish<br/>result + exitCode
+
+    Agent->>Agent: 清理Java/Python/浏览器/客户端残留进程
+    Agent->>RM: release lease<br/>清理结果 + 是否隔离
+    RM->>Lock: 释放账号锁 / UKey锁 / Worker锁
+    RM-->>Agent: Worker状态回到IDLE<br/>或异常时QUARANTINED

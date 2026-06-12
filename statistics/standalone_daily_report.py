@@ -11,245 +11,42 @@ Usage:
 """
 
 import argparse
-import configparser
-import json
-import os
-import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# --------------------------------------------------------------------------- #
-# 配置加载
-# --------------------------------------------------------------------------- #
+# 数据源、配置、工具函数统一由 data_source 模块提供
+from data_source import (
+    load_config,
+    get_standalone_config,
+    parse_stat_window,
+    queue_item_name,
+    status_name,
+    build_service_stats,
+    make_session,
+    fetch_token,
+    load_api_tasks_daily,
+    fetch_screenshot_map_daily,
+    fetch_run_support_map_daily,
+    fetch_execution_errors_daily,
+    QUEUE_ITEM_MAP,
+    STATUS_MAP,
+)
 
-_DEFAULT_CONF = Path(__file__).parent / "db.conf"
+# 错误码、分类规则、工具函数统一由 error_codes 模块管理
+from error_codes import (
+    CLASSIFY_RULES,
+    CLIENT_RUN_SUPPORT,
+    classify_reason,
+    classify_reason_l1,
+    ERROR_CODE_BY_LABEL,
+)
 
-QUEUE_ITEM_MAP: Dict[int, str] = {
-    1: "增减员", 6: "缴费", 7: "在册名单", 8: "费用明细",
-    9: "政策通知", 10: "基数申报", 11: "登录", 12: "查审核结果",
-    13: "调基名单", 14: "参保证明", 15: "获取待缴", 16: "申报核定",
-    17: "缴费扣款", 18: "获取凭据", 19: "撤销核定", 20: "公司参保证明",
-    21: "获取同步待缴", 22: "申报同步核定", 23: "获取缴费截图",
-}
-
-STATUS_MAP: Dict[int, str] = {
-    1: "执行中",
-    2: "待执行",
-    3: "执行中断",
-    4: "执行成功",
-}
-
-INVALID_REASONS = ["客户端异常", "网页端异常"]
-
-# 异常细分（顺序即优先级，先匹配先命中）
-CLASSIFY_RULES = [
-    ("报盘为空",        r"报盘为空|数据为空|待缴为空|费用为空|无待缴|没有待缴|未查询到待缴|无数据|没有数据"),
-    ("非办理时间",      r"非办理时间|不在办理时间|办理时间|业务办理时间|系统维护|暂停办理"),
-    ("UKey异常",        r"UKey|ukey|U盾|USB|usbkey|激活USB|证书过期|CA证书|ukey认证|key失效|key未插|key未找到"),
-    ("登录无效",        r"登录|登录无效|登录失效|会话失效|未登录|重新登录|验证码错误|账号密码错误|登录失败"),
-    ("操作指令失败",     r"win图片|图片点击失败|元素|控件|找不到元素|Selenium|Chrome|浏览器|cookie|token"),
-    ("网站异常",        r"网站异常|网站超时|页面打不开|页面加载|网站无响应|网络异常|连接失败|连接超时|请求超时|接口超时|http error|502|503|504"),
-    ("配置错误",        r"java.lang|NullPointerException|ClassCastException|RobotInterruptException|RobotRuntimeException|RuntimeException"),
-    ("其它原因",        r"环境异常|超时|500"),
-]
-
-def load_config(conf_path: Optional[Path] = None) -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser()
-    path = conf_path or _DEFAULT_CONF
-    if path.exists():
-        cfg.read(str(path), encoding="utf-8")
-    return cfg
-
-
-def get_standalone_config(cfg: configparser.ConfigParser) -> dict:
-    sec = cfg["standalone"] if cfg.has_section("standalone") else {}
-    return {
-        "base_url":     (sec.get("base_url") or os.getenv("RPA_STANDALONE_BASE_URL", "http://127.0.0.1:8080")).rstrip("/"),
-        "token_url":    sec.get("token_url") or os.getenv("RPA_STANDALONE_TOKEN_URL", "http://127.0.0.1:8888/oauth/token"),
-        "client_id":    sec.get("client_id") or os.getenv("RPA_STANDALONE_CLIENT_ID", "client"),
-        "client_secret": sec.get("client_secret") or os.getenv("RPA_STANDALONE_CLIENT_SECRET", "secret"),
-        "username":     sec.get("username") or os.getenv("RPA_STANDALONE_USERNAME", "admin"),
-        "password":     sec.get("password") or os.getenv("RPA_STANDALONE_PASSWORD", ""),
-    }
-
-
-# --------------------------------------------------------------------------- #
-# HTTP 会话
-# --------------------------------------------------------------------------- #
-
-def make_session(retries: int = 3, backoff: float = 0.5) -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=retries,
-        backoff_factor=backoff,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-
-def fetch_token(conf: dict, session: requests.Session) -> str:
-    """通过 OAuth2 password 模式获取 access_token。"""
-    resp = session.post(
-        conf["token_url"],
-        data={
-            "grant_type": "password",
-            "username": conf["username"],
-            "password": conf["password"],
-        },
-        auth=(conf["client_id"], conf["client_secret"]),
-        timeout=15,
-    )
-    resp.raise_for_status()
-    token = resp.json().get("access_token")
-    if not token:
-        raise RuntimeError(f"获取 token 失败，响应：{resp.text}")
-    return token
-
-
-# --------------------------------------------------------------------------- #
-# 接口调用
-# --------------------------------------------------------------------------- #
-
-def _post(session: requests.Session, url: str, token: str, payload: dict, timeout: int = 30) -> dict:
-    resp = session.post(
-        url,
-        json=payload,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        timeout=timeout,
-    )
-    resp.raise_for_status()
-    body = resp.json()
-    # 兼容 ResponseDTO 包装：{code, message, data}
-    if isinstance(body, dict) and "data" in body:
-        return body["data"]
-    return body
-
-
-def _extract_rows(body) -> List[dict]:
-    """
-    解析 /robot/taskQueue/page 响应，兼容两种结构：
-      - 包装: {code, message, data: {rows: [...], records: N}}
-      - 直接: {rows: [...], records: N}
-      - 列表: [...]
-    """
-    if isinstance(body, list):
-        return body
-    inner = body.get("data") if isinstance(body, dict) else None
-    target = inner if isinstance(inner, dict) else body
-    return target.get("rows") or target.get("list") or target.get("content") or []
-
-
-def fetch_task_queue_page(
-    base_url: str,
-    token: str,
-    session: requests.Session,
-    page: int,
-    page_size: int = 200,
-) -> List[dict]:
-    """
-    调用 POST /robot/taskQueue/page，按 pra_end_time 降序，取最近执行完成的记录。
-    接口的 startTime/endTime 过滤的是 create_time 而非 pra_start_time，因此不传日期，
-    依靠客户端按 praStartTime 过滤目标日期。
-    """
-    payload = {
-        "page": page,
-        "size": page_size,
-        "sidx": "qu.pra_end_time",
-        "sort": "desc",
-    }
-    resp = session.post(
-        f"{base_url}/robot/taskQueue/page",
-        json=payload,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return _extract_rows(resp.json())
-
-
-def load_all_task_queue(
-    base_url: str,
-    token: str,
-    session: requests.Session,
-    start_time: datetime,
-    end_time: datetime,
-) -> List[dict]:
-    """
-    按 pra_end_time 降序扫描，收集 praStartTime 落在统计日期的全部记录。
-    当连续一整页记录的 praStartTime 都早于统计日期时提前终止，避免全量扫描。
-    """
-    page_size = 200
-    all_rows: List[dict] = []
-    page = 1
-    stat_date_str = start_time.strftime("%Y-%m-%d")
-    # 统计日期的前一天，用于提前终止判断
-    prev_date_str = (start_time - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    while True:
-        rows = fetch_task_queue_page(base_url, token, session, page, page_size)
-        if not rows:
-            break
-
-        matched, past, future = [], 0, 0
-        for r in rows:
-            pra = str(r.get("praStartTime") or r.get("pra_start_time") or "")
-            if not pra:
-                continue
-            pra_date = pra[:10]
-            if pra_date == stat_date_str:
-                matched.append(r)
-            elif pra_date < stat_date_str:
-                past += 1
-            else:
-                future += 1
-
-        all_rows.extend(matched)
-        print(f"  第{page}页: 命中{len(matched)} 早于{past} 晚于{future} | 累计{len(all_rows)}", end="\r")
-
-        # 降序排列：若整页都早于统计日期，后续页只会更早，可以停止
-        if past == len(rows):
-            print(f"\n  整页记录均早于 {stat_date_str}，提前终止")
-            break
-        # 若整页都晚于统计日期（今天的数据），继续翻页
-        if len(rows) < page_size:
-            break
-        page += 1
-
-    print()
-    return all_rows
-
-
-# --------------------------------------------------------------------------- #
-# 字段转换
-# --------------------------------------------------------------------------- #
-
-def queue_item_name(queue_item) -> str:
-    try:
-        return QUEUE_ITEM_MAP.get(int(queue_item), f"未知-{queue_item}")
-    except (TypeError, ValueError):
-        return "未知"
-
-
-def status_name(status) -> str:
-    try:
-        return STATUS_MAP.get(int(status), f"未知-{status}")
-    except (TypeError, ValueError):
-        return "未知"
-
-
-TAX_DECLARE_SYSTEM = "10007007"
-ACCFUND_DECLARE_SYSTEM = "10008001"
-FORCE_CLIENT_ERROR_CITIES = {"上海", "成都"}
+# 空跑：仅以下错误码认定为无业务产出的空跑执行（与 robot_daily_report 保持一致）
+INVALID_ERROR_CODES = {"BIZ_NON_WORK_TIME_SMS"}
 
 SYS_NAME_MAP = {
     "10007001": "社保系统", "10007002": "养老系统", "10007003": "医疗系统",
@@ -259,42 +56,6 @@ SYS_NAME_MAP = {
 }
 
 
-def classify_reason(text: str) -> str:
-    if not text:
-        return "未记录原因"
-    value = str(text)
-    for name, pattern in CLASSIFY_RULES:
-        if re.search(pattern, value, re.IGNORECASE):
-            return name
-    return "其它原因"
-
-
-def classify_reason_l1(text: str, declare_system: str, city: str = "") -> str:
-    """一级大类：只有客户端异常和网页端异常两类。
-    客户端异常条件（满足任一即归入）：
-      - 条件1：税务系统（10007007）
-      - 条件2：上海 / 成都 的公积金系统（10008001）
-    其余全部归为网页端异常。
-    二级细分由 fail_reason_raw（CLASSIFY_RULES）提供。
-    """
-    ds = str(declare_system)
-    if ds == TAX_DECLARE_SYSTEM:
-        return "客户端异常"
-    if ds == ACCFUND_DECLARE_SYSTEM and str(city) in FORCE_CLIENT_ERROR_CITIES:
-        return "客户端异常"
-    return "网页端异常"
-
-
-def parse_stat_window(stat_date: Optional[str]) -> Tuple[datetime, datetime]:
-    if stat_date:
-        date_value = datetime.strptime(stat_date, "%Y-%m-%d").date()
-    else:
-        date_value = datetime.now().date()
-    start_time = datetime.combine(date_value, datetime.min.time())
-    end_time = start_time + timedelta(days=1)
-    return start_time, end_time
-
-
 # --------------------------------------------------------------------------- #
 # 报表构建
 # --------------------------------------------------------------------------- #
@@ -302,11 +63,14 @@ def parse_stat_window(stat_date: Optional[str]) -> Tuple[datetime, datetime]:
 def build_report(
     rows: List[dict],
     start_time: datetime,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    screenshot_map: dict = None,
+    run_support_map: dict = None,
+    mongo_df: pd.DataFrame = None,
+) -> Tuple:
 
     if not rows:
         empty = pd.DataFrame()
-        return empty, empty, empty, empty, empty, empty
+        return empty, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty
 
     task_df = pd.DataFrame(rows)
 
@@ -319,11 +83,60 @@ def build_report(
     task_df["status_int"] = pd.to_numeric(task_df.get("status", pd.Series(dtype=object)), errors="coerce").fillna(-1).astype(int)
     task_df["status_name"] = task_df["status_int"].apply(status_name)
     task_df["comment_text"] = task_df.get("comment", pd.Series(dtype=str)).fillna("")
-    task_df["fail_reason_raw"] = task_df["comment_text"].apply(classify_reason)
-    # 一级分类：税务系统 / 指定城市公积金 失败强制归为「客户端异常」
-    ds_col = "declareSystem" if "declareSystem" in task_df.columns else "declare_system"
+
+    # 一级分类：robot_flow.run_support=10019005 为客户端异常，其余归网页端异常
+    app_col = "appCode" if "appCode" in task_df.columns else "app_code"
+    if run_support_map and app_col in task_df.columns:
+        task_df["run_support"] = task_df[app_col].astype(str).map(
+            lambda x: run_support_map.get(x, "")
+        )
+    else:
+        task_df["run_support"] = ""
+
+    # ---------- 合并 MongoDB execution detail ----------
+    # mongo_df 由 fetch_execution_errors_daily 提供，含 executionCode / stepName / error / errorStack
+    ec_col = "executionCode" if "executionCode" in task_df.columns else "execution_code"
+    if mongo_df is not None and not mongo_df.empty:
+        mongo_df["executionCode"] = mongo_df["executionCode"].astype(str)
+        mongo_df["mongo_error_text"] = (
+            mongo_df.get("stepName",    pd.Series(dtype=str)).fillna("").astype(str) + " "
+            + mongo_df.get("error",     pd.Series(dtype=str)).fillna("").astype(str) + " "
+            + mongo_df.get("errorStack",pd.Series(dtype=str)).fillna("").astype(str)
+        )
+        task_df[ec_col] = task_df[ec_col].astype(str)
+        task_df = task_df.merge(
+            mongo_df[["executionCode", "mongo_error_text", "stepName"]],
+            how="left",
+            left_on=ec_col,
+            right_on="executionCode",
+            suffixes=("", "_mongo"),
+        )
+        task_df.drop(columns=["executionCode_mongo"], errors="ignore", inplace=True)
+    else:
+        task_df["mongo_error_text"] = ""
+        task_df["stepName"] = ""
+    task_df["mongo_error_text"] = task_df["mongo_error_text"].fillna("")
+    task_df["stepName"]         = task_df["stepName"].fillna("")
+
+    # fail_reason_raw：优先从 comment_text 匹配业务关键词，
+    # 未命中时用 mongo_error_text 补充技术异常原因（与 robot_daily_report 逻辑对齐）
+    def _classify_combined(comment: str, mongo_error: str) -> str:
+        raw = classify_reason(comment)
+        if raw != "未记录原因":
+            return raw
+        return classify_reason(mongo_error)
+
+    task_df["fail_reason_raw"] = task_df.apply(
+        lambda x: _classify_combined(x["comment_text"], x["mongo_error_text"]), axis=1
+    )
+
+    # fail_source_text 用于一级大类判断：有 mongo 就用 mongo，否则用 comment
+    task_df["fail_source_text"] = task_df.apply(
+        lambda x: x["mongo_error_text"] if x["mongo_error_text"].strip() else x["comment_text"],
+        axis=1,
+    )
     task_df["fail_reason"] = task_df.apply(
-        lambda x: classify_reason_l1(x["comment_text"], x.get(ds_col, ""), x.get("city", "")), axis=1
+        lambda x: classify_reason_l1(x["fail_source_text"], x.get("run_support", "")), axis=1
     )
 
     # 账号
@@ -337,21 +150,32 @@ def build_report(
         task_df["machineCode"] = ""
 
     # ---------- 汇总 ----------
-    total_count = len(task_df)
+    # 报盘为空（BIZ_REPORT_EMPTY）认定为成功，从 status=3 中剔除，不纳入失败统计。
+    report_empty_mask = (task_df["status_int"] == 3) & (
+        task_df["comment_text"].apply(classify_reason) == "下载报盘文件为空"
+    )
+    task_df.loc[report_empty_mask, "status_int"]  = 4
+    task_df.loc[report_empty_mask, "status_name"] = "执行成功"
+    total_count   = len(task_df)
     success_count = int((task_df["status_int"] == 4).sum())
-    fail_count = int((task_df["status_int"] == 3).sum())
-    other_count = total_count - success_count - fail_count
-    success_rate = round(success_count / total_count * 100, 2) if total_count else 0
+    fail_count    = int((task_df["status_int"] == 3).sum())
+    other_count   = total_count - success_count - fail_count
+    success_rate  = round(success_count / total_count * 100, 2) if total_count else 0
 
+    # 空跑数量字段先占位，构建 invalid_df 后回填
     summary_df = pd.DataFrame([{
-        "统计日期": start_time.strftime("%Y-%m-%d"),
-        "实际执行任务数（含所有状态）": total_count,
-        "执行成功任务数（status=4）": success_count,
-        "执行失败任务数（status=3）": fail_count,
+        "统计日期":               start_time.strftime("%Y-%m-%d"),
+        "实际执行任务总数":       total_count,
+        "执行成功任务数":         success_count,
+        "执行失败任务数":         fail_count,
+        "报盘为空任务数（计入成功）": int(report_empty_mask.sum()),
         "其他状态数（执行中/待执行）": other_count,
         "今日成功率（成功/总量）": f"{success_rate}%",
+        "空跑数量":               0,
+        "空跑占比（空跑/失败）":   "—",
     }])
 
+    # 各状态明细
     status_breakdown = (
         task_df.groupby("status_name").size()
         .reset_index(name="数量")
@@ -361,7 +185,6 @@ def build_report(
     # ---------- 失败 Top10 ----------
     fail_df = task_df[task_df["status_int"] == 3].copy()
 
-    # 按失败原因汇总
     failure_by_reason = (
         fail_df.groupby("fail_reason", dropna=False)
         .size()
@@ -371,7 +194,6 @@ def build_report(
     )
     failure_by_reason.rename(columns={"fail_reason": "失败原因"}, inplace=True)
 
-    # 按五维度分组
     failure_top10 = (
         fail_df.groupby(
             ["fail_reason", "city", "account", "machineCode", "task_type"],
@@ -390,20 +212,24 @@ def build_report(
         "task_type": "任务类型",
     }, inplace=True)
 
-    # ---------- 空跑 ----------
-    invalid_df = fail_df[fail_df["fail_reason"].isin(INVALID_REASONS)].copy()
+    # ---------- 空跑（与 robot_daily_report 对齐：基于 ERROR_CODE_BY_LABEL 精确匹配）----------
+    def _is_invalid(raw_reason: str) -> bool:
+        meta = ERROR_CODE_BY_LABEL.get(str(raw_reason))
+        return meta is not None and meta.code in INVALID_ERROR_CODES
+
+    invalid_df = fail_df[fail_df["fail_reason_raw"].apply(_is_invalid)].copy()
 
     invalid_summary = (
-        invalid_df.groupby("fail_reason", dropna=False)
+        invalid_df.groupby("fail_reason_raw", dropna=False)
         .size()
         .reset_index(name="空跑数量")
         .sort_values("空跑数量", ascending=False)
     )
-    invalid_summary.rename(columns={"fail_reason": "空跑类型"}, inplace=True)
+    invalid_summary.rename(columns={"fail_reason_raw": "空跑类型"}, inplace=True)
 
     invalid_detail = (
         invalid_df.groupby(
-            ["fail_reason", "city", "account", "machineCode", "task_type"],
+            ["fail_reason_raw", "city", "account", "machineCode", "task_type"],
             dropna=False,
         )
         .size()
@@ -411,15 +237,20 @@ def build_report(
         .sort_values("空跑次数", ascending=False)
     )
     invalid_detail.rename(columns={
-        "fail_reason": "空跑类型",
+        "fail_reason_raw": "空跑类型",
         "city": "城市",
         "account": "账号",
         "machineCode": "盒子",
         "task_type": "任务类型",
     }, inplace=True)
 
+    # 回填空跑统计到 summary_df
+    invalid_total = len(invalid_df)
+    invalid_rate  = f"{round(invalid_total / fail_count * 100, 1)}%" if fail_count else "—"
+    summary_df.at[0, "空跑数量"]             = invalid_total
+    summary_df.at[0, "空跑占比（空跑/失败）"] = invalid_rate
+
     # ---------- 业务分类统计 ----------
-    # 计算执行时长（分钟）
     for tc in ["praStartTime", "pra_start_time"]:
         if tc in task_df.columns:
             task_df["_start"] = pd.to_datetime(task_df[tc], errors="coerce")
@@ -440,150 +271,132 @@ def build_report(
         .round(2)
         .clip(lower=0)
     )
-    # 失败步骤：从 comment_text 提取首行（接口数据无 MongoDB stepName）
-    task_df["fail_step"] = task_df["comment_text"].str.replace("\n", " ").str.strip().str[:80]
 
-    service_stats = _build_service_stats(task_df, status_col="status_int", s4=4, s3=3,
-                                         city_col="city", machine_col="machineCode",
-                                         duration_col="duration_min", fail_step_col="fail_step",
-                                         fail_reason_col="fail_reason")
+    # fail_step：优先用 MongoDB stepName，兜底用 comment_text 首行
+    task_df["fail_step"] = task_df.apply(
+        lambda x: (
+            str(x.get("stepName") or "").strip()
+            or str(x.get("comment_text") or "").replace("\n", " ").strip()[:80]
+        ), axis=1
+    )
 
-    # ---------- 二级原因统计（通用辅助）----------
-    acc_col = "account" if "account" in fail_df.columns else "declareAccount"
-    mc_col  = "machineCode" if "machineCode" in fail_df.columns else "machine_code"
+    service_stats = build_service_stats(task_df, status_col="status_int", s4=4, s3=3,
+                                        city_col="city", machine_col="machineCode",
+                                        duration_col="duration_min", fail_step_col="fail_step",
+                                        fail_reason_col="fail_reason")
 
+    # ---------- 错误码归因分析（与 robot_daily_report 对齐）----------
     def _join_unique(series, sep="、", limit=5) -> str:
         vals = sorted({str(v) for v in series.dropna() if str(v).strip()})
         return sep.join(vals[:limit]) + ("…" if len(vals) > limit else "")
 
+    total_fail_cnt = len(fail_df)
+    attrib_rows = []
+    for raw_reason, grp in fail_df.groupby("fail_reason_raw", dropna=False):
+        cnt  = len(grp)
+        meta = ERROR_CODE_BY_LABEL.get(str(raw_reason))
+        attrib_rows.append({
+            "错误码标识":    meta.code  if meta else "—",
+            "异常原因":      str(raw_reason),
+            "一级分类":      meta.l1    if meta else "—",
+            "失败数量":      cnt,
+            "占比":          f"{round(cnt / total_fail_cnt * 100, 1)}%" if total_fail_cnt else "—",
+            "责任人":        meta.owner if meta else "—",
+            "是否可自动修复": "是" if (meta and meta.auto_fix) else "否",
+            "涉及城市":      _join_unique(grp["city"]),
+            "涉及业务类型":  _join_unique(grp["task_type"]),
+            "涉及账号":      _join_unique(grp["account"]),
+            "涉及盒子":      _join_unique(grp["machineCode"]),
+        })
+    error_code_attribution_df = (
+        pd.DataFrame(attrib_rows)
+        .sort_values("失败数量", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    # ---------- 二级原因统计 ----------
     def _build_secondary(sub_df: pd.DataFrame, col_name: str) -> pd.DataFrame:
         total = len(sub_df)
-        rows = []
+        sec_rows = []
         for raw_reason, grp in sub_df.groupby("fail_reason_raw", dropna=False):
             cnt = len(grp)
-            rows.append({
-                col_name:    str(raw_reason),
-                "失败数量":  cnt,
-                "占比":      f"{round(cnt / total * 100, 1)}%" if total else "—",
-                "涉及城市":  _join_unique(grp["city"]),
-                "涉及账号":  _join_unique(grp[acc_col]),
-                "涉及盒子":  _join_unique(grp[mc_col]),
+            sec_rows.append({
+                col_name:       str(raw_reason),
+                "失败数量":     cnt,
+                "占比":         f"{round(cnt / total * 100, 1)}%" if total else "—",
+                "涉及城市":     _join_unique(grp["city"]),
+                "涉及账号":     _join_unique(grp["account"]),
+                "涉及盒子":     _join_unique(grp["machineCode"]),
                 "涉及业务类型": _join_unique(grp["task_type"]),
             })
-        return (pd.DataFrame(rows).sort_values("失败数量", ascending=False).reset_index(drop=True)
-                if rows else pd.DataFrame())
+        return (pd.DataFrame(sec_rows).sort_values("失败数量", ascending=False).reset_index(drop=True)
+                if sec_rows else pd.DataFrame())
 
-    # ---------- 客户端异常二级原因统计 ----------
-    client_fail_df = fail_df[fail_df["fail_reason"] == "客户端异常"].copy()
-    client_secondary_df = _build_secondary(client_fail_df, "客户端异常二级原因")
+    client_secondary_df = _build_secondary(
+        fail_df[fail_df["fail_reason"] == "客户端异常"].copy(), "客户端异常二级原因"
+    )
+    web_secondary_df = _build_secondary(
+        fail_df[fail_df["fail_reason"] == "网页端异常"].copy(), "网页端异常二级原因"
+    )
 
-    # ---------- 网页端异常二级原因统计 ----------
-    web_fail_df = fail_df[fail_df["fail_reason"] == "网页端异常"].copy()
-    web_secondary_df = _build_secondary(web_fail_df, "网页端异常二级原因")
+    # ---------- 截图归因统计 ----------
+    if screenshot_map and ec_col in task_df.columns:
+        task_df["screenshot_url"] = task_df[ec_col].astype(str).map(
+            lambda x: screenshot_map.get(x, "")
+        )
+    else:
+        task_df["screenshot_url"] = ""
 
-    # 原始明细：只保留关键列
+    task_df["has_screenshot"] = task_df["screenshot_url"].str.strip().ne("")
+
+    total_fail       = len(fail_df)
+    fail_with_shot   = int(task_df.loc[task_df["status_int"] == 3, "has_screenshot"].sum())
+    client_fail_mask = (task_df["status_int"] == 3) & (task_df["fail_reason"] == "客户端异常")
+    client_fail_cnt  = int(client_fail_mask.sum())
+    client_with_shot = int((client_fail_mask & task_df["has_screenshot"]).sum())
+
+    screenshot_summary_df = pd.DataFrame([{
+        "失败任务数量":              total_fail,
+        "有失败截图的任务数":         fail_with_shot,
+        "截图覆盖率":                f"{round(fail_with_shot / total_fail * 100, 1)}%" if total_fail else "—",
+        "客户端异常任务数":           client_fail_cnt,
+        "客户端异常中有截图的任务数":  client_with_shot,
+        "客户端截图覆盖率":           f"{round(client_with_shot / client_fail_cnt * 100, 1)}%" if client_fail_cnt else "—",
+    }])
+
     keep_cols = [c for c in [
         "id", "clientId", "executionCode", "machineCode", "taskCode",
         "declareAccount", "companyName", "businessType", "declareSystem",
         "queueItem", "task_type", "city", "status_int", "status_name",
         "loginStatus", "praStartTime", "praEndTime", "duration_min",
-        "comment_text", "fail_reason_raw", "fail_reason",
+        "comment_text", "mongo_error_text", "fail_reason_raw", "fail_reason", "screenshot_url",
     ] if c in task_df.columns]
     detail_df = task_df[keep_cols].copy()
 
-    return detail_df, summary_df, failure_by_reason, failure_top10, invalid_summary, invalid_detail, status_breakdown, service_stats, client_secondary_df, web_secondary_df
-
-
-# --------------------------------------------------------------------------- #
-# 业务分类统计（与 robot_daily_report.py 共用同一逻辑）
-# --------------------------------------------------------------------------- #
-
-def _build_service_stats(
-    df: pd.DataFrame,
-    status_col: str,
-    s4: int,
-    s3: int,
-    city_col: str,
-    machine_col: str,
-    duration_col: str,
-    fail_step_col: str,
-    fail_reason_col: str,
-) -> pd.DataFrame:
-    records = []
-    for task_type, grp in df.groupby("task_type", dropna=False):
-        total   = len(grp)
-        success = int((grp[status_col] == s4).sum())
-        fail    = int((grp[status_col] == s3).sum())
-        rate    = f"{round(success / total * 100, 1)}%" if total else "—"
-
-        dur      = grp[duration_col].dropna()
-        total_min = round(dur.sum(), 1)
-        avg_min   = round(dur.mean(), 1) if len(dur) else 0
-        max_min   = round(dur.max(), 1)  if len(dur) else 0
-
-        fail_grp = grp[grp[status_col] == s3]
-
-        main_reason = (
-            fail_grp[fail_reason_col].value_counts().index[0]
-            if len(fail_grp) and fail_reason_col in fail_grp.columns
-            else "—"
-        )
-
-        def _count_reason(keyword):
-            return int((fail_grp[fail_reason_col].str.contains(keyword, na=False)).sum()) if len(fail_grp) else 0
-
-        client_err = _count_reason("客户端异常")
-        login_err  = _count_reason("登录无效")
-        ukey_err   = _count_reason("UKey异常")
-
-        top_city = (
-            fail_grp[city_col].value_counts().index[0]
-            if len(fail_grp) and city_col in fail_grp.columns else "—"
-        )
-        top_machine = (
-            fail_grp[machine_col].value_counts().index[0]
-            if len(fail_grp) and machine_col in fail_grp.columns else "—"
-        )
-
-        if len(fail_grp) and fail_step_col in fail_grp.columns:
-            step_counts = (
-                fail_grp[fail_step_col]
-                .dropna()
-                .loc[lambda s: s.str.strip() != ""]
-                .value_counts()
-            )
-            top_step = step_counts.index[0][:80] if len(step_counts) else "—"
-        else:
-            top_step = "—"
-
-        records.append({
-            "业务类型（服务项）": task_type,
-            "任务总数":     total,
-            "成功数":       success,
-            "失败数":       fail,
-            "成功率":       rate,
-            "总执行时长(分)":   total_min,
-            "平均执行时长(分)": avg_min,
-            "最大执行时长(分)": max_min,
-            "主要失败原因":  main_reason,
-            "客户端异常数":  client_err,
-            "登录无效数":    login_err,
-            "UKey异常数":   ukey_err,
-            "Top城市":      top_city,
-            "Top盒子":      top_machine,
-            "Top失败步骤":  top_step,
-        })
-
-    result = pd.DataFrame(records)
-    if not result.empty:
-        result.sort_values("任务总数", ascending=False, inplace=True)
-        result.reset_index(drop=True, inplace=True)
-    return result
+    return (detail_df, summary_df, failure_by_reason, failure_top10,
+            invalid_summary, invalid_detail, status_breakdown, service_stats,
+            error_code_attribution_df, client_secondary_df, web_secondary_df, screenshot_summary_df)
 
 
 # --------------------------------------------------------------------------- #
 # 输出：Excel
 # --------------------------------------------------------------------------- #
+
+def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """清理 DataFrame 中字符串列里 openpyxl/XML 1.0 不接受的非法控制字符。"""
+    import re
+    _ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+    def _clean(v):
+        if isinstance(v, str):
+            cleaned = _ILLEGAL.sub("", v)
+            if len(cleaned) > 32767:
+                cleaned = cleaned[:32760] + "…[截断]"
+            return cleaned
+        return v
+
+    return df.apply(lambda col: col.map(_clean) if col.dtype == object else col)
+
 
 def write_report(
     output_file: Path,
@@ -595,21 +408,25 @@ def write_report(
     invalid_detail: pd.DataFrame,
     status_breakdown: pd.DataFrame,
     service_stats: pd.DataFrame,
+    error_code_attribution_df: pd.DataFrame,
     client_secondary_df: pd.DataFrame,
     web_secondary_df: pd.DataFrame,
+    screenshot_summary_df: pd.DataFrame,
 ) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, sheet_name="总览", index=False)
-        status_breakdown.to_excel(writer, sheet_name="状态分布", index=False)
-        service_stats.to_excel(writer, sheet_name="业务分类统计", index=False)
-        failure_by_reason.to_excel(writer, sheet_name="失败原因Top10", index=False)
-        failure_top10.to_excel(writer, sheet_name="失败明细Top10", index=False)
-        client_secondary_df.to_excel(writer, sheet_name="客户端异常二级原因", index=False)
-        web_secondary_df.to_excel(writer, sheet_name="网页端异常二级原因", index=False)
-        invalid_summary.to_excel(writer, sheet_name="空跑汇总", index=False)
-        invalid_detail.to_excel(writer, sheet_name="空跑明细", index=False)
-        detail_df.to_excel(writer, sheet_name="原始任务明细", index=False)
+        _sanitize_df(summary_df).to_excel(writer, sheet_name="总览", index=False)
+        _sanitize_df(status_breakdown).to_excel(writer, sheet_name="状态分布", index=False)
+        _sanitize_df(service_stats).to_excel(writer, sheet_name="业务分类统计", index=False)
+        _sanitize_df(failure_by_reason).to_excel(writer, sheet_name="失败原因Top10", index=False)
+        _sanitize_df(failure_top10).to_excel(writer, sheet_name="失败明细Top10", index=False)
+        _sanitize_df(error_code_attribution_df).to_excel(writer, sheet_name="错误码归因分析", index=False)
+        _sanitize_df(client_secondary_df).to_excel(writer, sheet_name="客户端异常二级原因", index=False)
+        _sanitize_df(web_secondary_df).to_excel(writer, sheet_name="网页端异常二级原因", index=False)
+        _sanitize_df(screenshot_summary_df).to_excel(writer, sheet_name="截图归因统计", index=False)
+        _sanitize_df(invalid_summary).to_excel(writer, sheet_name="空跑汇总", index=False)
+        _sanitize_df(invalid_detail).to_excel(writer, sheet_name="空跑明细", index=False)
+        _sanitize_df(detail_df).to_excel(writer, sheet_name="原始任务明细", index=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -637,8 +454,10 @@ def write_markdown(
     invalid_summary: pd.DataFrame,
     invalid_detail: pd.DataFrame,
     service_stats: pd.DataFrame,
+    error_code_attribution_df: pd.DataFrame,
     client_secondary_df: pd.DataFrame,
     web_secondary_df: pd.DataFrame,
+    screenshot_summary_df: pd.DataFrame,
 ) -> None:
     md_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -649,12 +468,13 @@ def write_markdown(
                 return str(v) if v is not None else default
         return default
 
-    total   = _val(summary_df, "实际执行")
-    success = _val(summary_df, "成功任务")
-    fail    = _val(summary_df, "失败任务")
-    other   = _val(summary_df, "其他状态")
-    rate    = _val(summary_df, "成功率")
-    inv_total = str(invalid_detail["空跑次数"].sum()) if not invalid_detail.empty and "空跑次数" in invalid_detail.columns else "0"
+    total     = _val(summary_df, "实际执行")
+    success   = _val(summary_df, "成功任务")
+    fail      = _val(summary_df, "失败任务")
+    other     = _val(summary_df, "其他状态")
+    rate      = _val(summary_df, "成功率")
+    inv_count = _val(summary_df, "空跑数量")
+    inv_rate  = _val(summary_df, "空跑占比")
 
     lines = [
         "# RPA 机器人每日执行统计报告（独立部署）",
@@ -667,12 +487,13 @@ def write_markdown(
         "",
         "| 指标 | 数值 |",
         "| --- | --- |",
-        f"| 实际执行任务数（含所有状态） | **{total}** |",
-        f"| 执行成功任务数（status=4） | **{success}** |",
-        f"| 执行失败任务数（status=3 执行中断） | **{fail}** |",
+        f"| 实际执行任务总数（含所有状态） | **{total}** |",
+        f"| 执行成功任务数 | **{success}** |",
+        f"| 执行失败任务数 | **{fail}** |",
         f"| 其他状态数（执行中 / 待执行） | **{other}** |",
         f"| 今日成功率（成功 / 总量） | **{rate}** |",
-        f"| 空跑总数 | **{inv_total}** |",
+        f"| 空跑数量 | **{inv_count}** |",
+        f"| 空跑占比（空跑 / 失败） | **{inv_rate}** |",
         "",
         "---",
         "",
@@ -691,9 +512,14 @@ def write_markdown(
         "> 按「失败原因 × 城市 × 账号 × 盒子 × 任务类型」分组，取失败次数最多的 10 组。",
         "",
         _df_to_md(failure_top10),
+        "### 错误码归因分析",
+        "",
+        "> 按 error_codes.py 标准错误码对所有失败记录归类，含错误码标识、一级分类、责任人及影响范围。",
+        "",
+        _df_to_md(error_code_attribution_df),
         "### 客户端异常二级原因",
         "",
-        "> 税务系统（10007007）及指定城市公积金的失败均归入「客户端异常」大类；下表按原始分类（CLASSIFY_RULES）展示二级原因。",
+        "> robot_flow.run_support=10019005（客户端运行载体）的失败归入「客户端异常」大类；下表按原始分类（CLASSIFY_RULES）展示二级原因。",
         "",
         _df_to_md(client_secondary_df),
         "### 网页端异常二级原因",
@@ -701,11 +527,16 @@ def write_markdown(
         "> 网站异常、报盘为空、非办理时间等归入「网页端异常」大类；下表按原始分类展示二级原因。",
         "",
         _df_to_md(web_secondary_df),
+        "### 截图归因统计",
+        "",
+        "> 统计失败任务中截图文件的覆盖情况，截图链接详见 Excel「原始任务明细」sheet 的 screenshot_url 列。",
+        "",
+        _df_to_md(screenshot_summary_df),
         "---",
         "",
         "## 四、空跑汇总",
         "",
-        "> 空跑定义：报盘为空、非办理时间、登录无效、UKey异常、网站异常、客户端异常、其它环境异常等无实际业务产出的执行。",
+        "> 空跑定义：错误码为 BIZ_NON_WORK_TIME_SMS（非工作时间不发短信）的无业务产出执行。报盘为空（BIZ_REPORT_EMPTY）单独统计，不计入错误。",
         "",
         _df_to_md(invalid_summary),
         "### 空跑明细",
@@ -753,15 +584,30 @@ def main() -> None:
     print("token 获取成功")
 
     print(f"正在拉取 {start_time.strftime('%Y-%m-%d')} 执行队列数据...")
-    rows = load_all_task_queue(conf["base_url"], token, session, start_time, end_time)
+    rows = load_api_tasks_daily(conf["base_url"], token, session, start_time, end_time)
     print(f"共拉取 {len(rows)} 条记录")
 
     if not rows:
         print("当天没有实际执行任务")
         return
 
-    result = build_report(rows, start_time)
-    detail_df, summary_df, failure_by_reason, failure_top10, invalid_summary, invalid_detail, status_breakdown, service_stats, client_secondary_df, web_secondary_df = result
+    print("正在拉取截图信息...")
+    screenshot_map = fetch_screenshot_map_daily(conf["base_url"], token, session, start_time, end_time)
+    print(f"截图映射加载完成，共 {len(screenshot_map)} 条")
+
+    print("正在拉取 run_support 信息...")
+    run_support_map = fetch_run_support_map_daily(conf["base_url"], token, session)
+    print(f"run_support 映射加载完成，共 {len(run_support_map)} 条")
+
+    fail_rows = [r for r in rows if int(r.get("status", -1)) == 3]
+    print(f"正在拉取 {len(fail_rows)} 条失败任务的执行明细（stepName / errorStack）...")
+    mongo_df = fetch_execution_errors_daily(conf["base_url"], token, session, fail_rows)
+    print(f"执行明细加载完成，共 {len(mongo_df)} 条")
+
+    result = build_report(rows, start_time, screenshot_map, run_support_map, mongo_df)
+    (detail_df, summary_df, failure_by_reason, failure_top10,
+     invalid_summary, invalid_detail, status_breakdown, service_stats,
+     error_code_attribution_df, client_secondary_df, web_secondary_df, screenshot_summary_df) = result
 
     print("\n===== 今日执行总览 =====")
     print(summary_df.to_string(index=False))
@@ -778,11 +624,17 @@ def main() -> None:
     print("\n===== 失败 Top10（五维度明细）=====")
     print(failure_top10.to_string(index=False))
 
+    print("\n===== 错误码归因分析 =====")
+    print(error_code_attribution_df.to_string(index=False))
+
     print("\n===== 客户端异常二级原因 =====")
     print(client_secondary_df.to_string(index=False))
 
     print("\n===== 网页端异常二级原因 =====")
     print(web_secondary_df.to_string(index=False))
+
+    print("\n===== 截图归因统计 =====")
+    print(screenshot_summary_df.to_string(index=False))
 
     print("\n===== 空跑数量汇总 =====")
     print(invalid_summary.to_string(index=False))
@@ -792,13 +644,17 @@ def main() -> None:
         Path(args.output) if args.output
         else _REPORTS_DIR / f"standalone_daily_report_{date_str}.xlsx"
     )
-    write_report(xlsx_file, detail_df, summary_df, failure_by_reason, failure_top10, invalid_summary, invalid_detail, status_breakdown, service_stats, client_secondary_df, web_secondary_df)
+    write_report(xlsx_file, detail_df, summary_df, failure_by_reason, failure_top10,
+                 invalid_summary, invalid_detail, status_breakdown, service_stats,
+                 error_code_attribution_df, client_secondary_df, web_secondary_df, screenshot_summary_df)
     print(f"\nExcel 报表已生成：{xlsx_file}")
 
     # Markdown
     md_file = _REPORTS_DIR / f"standalone_daily_report_{date_str}.md"
     write_markdown(md_file, start_time.strftime("%Y-%m-%d"),
-                   summary_df, status_breakdown, failure_by_reason, failure_top10, invalid_summary, invalid_detail, service_stats, client_secondary_df, web_secondary_df)
+                   summary_df, status_breakdown, failure_by_reason, failure_top10,
+                   invalid_summary, invalid_detail, service_stats,
+                   error_code_attribution_df, client_secondary_df, web_secondary_df, screenshot_summary_df)
     print(f"Markdown 报表已生成：{md_file}")
 
 
